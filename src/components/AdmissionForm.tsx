@@ -20,8 +20,11 @@ import {
   type ApplicationFee,
   type TrackResult,
   type WebsiteContentRecord,
+  type GatewayConfig,
 } from "@/lib/api";
 import { asArray, getBlockBody } from "@/lib/content";
+
+type GatewayId = 'FLUTTERWAVE' | 'PAYSTACK';
 
 /* ─── helpers ─── */
 const inputCls =
@@ -127,7 +130,8 @@ export default function AdmissionForm({ blocks }: { blocks?: WebsiteContentRecor
 
   // Payment state
   const [appFees, setAppFees] = useState<ApplicationFee[]>([]);
-  const [flutterwaveKey, setFlutterwaveKey] = useState("");
+  const [activeGateways, setActiveGateways] = useState<GatewayConfig[]>([]);
+  const [selectedGateway, setSelectedGateway] = useState<GatewayId>('FLUTTERWAVE');
   const [paying, setPaying] = useState(false);
   const [verifying, setVerifying] = useState(false);
   const paymentTxRef = useRef("");
@@ -147,12 +151,20 @@ export default function AdmissionForm({ blocks }: { blocks?: WebsiteContentRecor
 
   const formRef = useRef<HTMLFormElement>(null);
 
-  // Load application fees and Flutterwave config on mount
+  // Load application fees and available payment gateways on mount
   useEffect(() => {
     financeApi.getApplicationFees().then(setAppFees).catch(() => {});
-    financeApi.getFlutterwaveConfig().then((cfg) => {
-      if (cfg.publicKey) setFlutterwaveKey(cfg.publicKey);
-    }).catch(() => {});
+    financeApi.getPaymentGateways()
+      .then((res) => {
+        setActiveGateways(res.gateways);
+        if (res.gateways.length > 0) {
+          setSelectedGateway(res.gateways[0].id as GatewayId);
+        }
+      })
+      .catch(() => {
+        // Fallback: assume Flutterwave is available
+        setActiveGateways([{ id: 'FLUTTERWAVE', name: 'Flutterwave', publicKey: '', enabled: true }]);
+      });
   }, []);
 
   /* ── dynamic table helpers ── */
@@ -166,7 +178,19 @@ export default function AdmissionForm({ blocks }: { blocks?: WebsiteContentRecor
     const c = [...arr]; c[idx] = { ...c[idx], [key]: val }; setter(c);
   }
 
-  /* ── Flutterwave script loader ── */
+  /* ── Gateway script loaders ── */
+  const loadPaystackScript = useCallback((): Promise<void> => {
+    if ((window as any).PaystackPop) return Promise.resolve();
+    return new Promise<void>((resolve, reject) => {
+      const script = document.createElement("script");
+      script.src = "https://js.paystack.co/v1/inline.js";
+      script.async = true;
+      script.onload = () => resolve();
+      script.onerror = () => reject(new Error("Failed to load Paystack"));
+      document.head.appendChild(script);
+    });
+  }, []);
+
   const loadFlutterwaveScript = useCallback((): Promise<void> => {
     if ((window as any).FlutterwaveCheckout) return Promise.resolve();
     return new Promise<void>((resolve, reject) => {
@@ -174,7 +198,7 @@ export default function AdmissionForm({ blocks }: { blocks?: WebsiteContentRecor
       script.src = "https://checkout.flutterwave.com/v3.js";
       script.async = true;
       script.onload = () => resolve();
-      script.onerror = () => reject(new Error("Failed to load payment gateway"));
+      script.onerror = () => reject(new Error("Failed to load Flutterwave"));
       document.head.appendChild(script);
     });
   }, []);
@@ -231,7 +255,7 @@ export default function AdmissionForm({ blocks }: { blocks?: WebsiteContentRecor
       await submitApplication();
       return;
     }
-    if (!flutterwaveKey) {
+    if (activeGateways.length === 0) {
       setError("Payment system not configured. Please refresh the page or contact support.");
       return;
     }
@@ -251,6 +275,7 @@ export default function AdmissionForm({ blocks }: { blocks?: WebsiteContentRecor
         amount: totalFees,
         customerEmail: email,
         purpose: `Application fees: ${appFees.map(f => f.name).join(", ")}`,
+        gateway: selectedGateway,
       });
       paymentRef = initResult.reference;
       paymentTxRef.current = paymentRef;
@@ -260,9 +285,13 @@ export default function AdmissionForm({ blocks }: { blocks?: WebsiteContentRecor
       return;
     }
 
-    // Step 2: Load Flutterwave script
+    // Step 2: Load the appropriate gateway script
     try {
-      await loadFlutterwaveScript();
+      if (selectedGateway === 'PAYSTACK') {
+        await loadPaystackScript();
+      } else {
+        await loadFlutterwaveScript();
+      }
     } catch {
       setPaying(false);
       setError("Could not load payment gateway. Please check your connection and try again.");
@@ -270,55 +299,96 @@ export default function AdmissionForm({ blocks }: { blocks?: WebsiteContentRecor
     }
 
     const win = window as any;
-    if (typeof win.FlutterwaveCheckout !== "function") {
-      setPaying(false);
-      setError("Payment gateway could not initialize. Please try again.");
-      return;
-    }
+    const gwPublicKey = activeGateways.find(g => g.id === selectedGateway)?.publicKey ?? '';
 
-    // Step 3: Open Flutterwave checkout with the backend-generated reference
-    win.FlutterwaveCheckout({
-      public_key: flutterwaveKey,
-      tx_ref: paymentRef,
-      amount: totalFees,
-      currency: "NGN",
-      payment_options: "card, bank_transfer, ussd",
-      customer: { email, name: `${surname} ${otherNames}` },
-      customizations: {
-        title: "Application Fee Payment",
-        description: `Admission application — ${appFees.map(f => f.name).join(", ")}`,
-        logo: "",
-      },
-      async callback(data: any) {
-        // Flutterwave v3 callback fires when checkout completes.
-        // We do NOT check data.status here because Flutterwave's inline
-        // callback doesn't always include it — we verify server-side instead.
+    if (selectedGateway === 'PAYSTACK') {
+      // ── Paystack checkout ──
+      if (typeof win.PaystackPop?.setup !== "function") {
         setPaying(false);
-        setVerifying(true);
-        try {
-          const verification = await financeApi.verifyPayment(paymentRef);
-          const verifyStatus = verification.status?.toUpperCase?.() ?? "";
-          if (verifyStatus !== "SUCCESS" && verifyStatus !== "SUCCESSFUL") {
-            setError("Payment verification returned status: " + (verification.status ?? "unknown") + ". Please contact support with reference: " + paymentRef);
+        setError("Payment gateway could not initialize. Please try again.");
+        return;
+      }
+      const paystackHandler = win.PaystackPop.setup({
+        key: gwPublicKey,
+        email,
+        amount: Math.round(totalFees * 100), // Paystack uses kobo
+        currency: 'NGN',
+        ref: paymentRef,
+        metadata: {
+          custom_fields: [
+            { display_name: "Applicant", variable_name: "applicant_name", value: `${surname} ${otherNames}` },
+            { display_name: "Purpose", variable_name: "purpose", value: `Application fees: ${appFees.map(f => f.name).join(', ')}` },
+          ],
+        },
+        onSuccess: async () => {
+          setPaying(false);
+          setVerifying(true);
+          try {
+            const verification = await financeApi.verifyPayment(paymentRef);
+            const verifyStatus = verification.status?.toUpperCase?.() ?? "";
+            if (verifyStatus !== "SUCCESS" && verifyStatus !== "SUCCESSFUL") {
+              setError("Payment verification returned status: " + (verification.status ?? "unknown") + ". Please contact support with reference: " + paymentRef);
+              setVerifying(false);
+              return;
+            }
+            await submitApplication();
+          } catch (err) {
             setVerifying(false);
-            return;
+            setError(err instanceof Error ? err.message : "Payment verification failed. Please contact support with reference: " + paymentRef);
           }
-          // Payment verified — submit the application
-          await submitApplication();
-        } catch (err) {
-          setVerifying(false);
-          setError(err instanceof Error ? err.message : "Payment verification failed. Please contact support with reference: " + paymentRef);
-        }
-      },
-      onclose() {
-        // User closed the checkout modal without completing payment
-        // Only reset if we're not in the middle of verifying
-        setVerifying((v) => {
-          if (!v) setPaying(false);
-          return v;
-        });
-      },
-    });
+        },
+        onClose: () => {
+          setVerifying((v) => {
+            if (!v) setPaying(false);
+            return v;
+          });
+        },
+      });
+      paystackHandler.openIframe();
+    } else {
+      // ── Flutterwave checkout ──
+      if (typeof win.FlutterwaveCheckout !== "function") {
+        setPaying(false);
+        setError("Payment gateway could not initialize. Please try again.");
+        return;
+      }
+      win.FlutterwaveCheckout({
+        public_key: gwPublicKey,
+        tx_ref: paymentRef,
+        amount: totalFees,
+        currency: "NGN",
+        payment_options: "card, bank_transfer, ussd",
+        customer: { email, name: `${surname} ${otherNames}` },
+        customizations: {
+          title: "Application Fee Payment",
+          description: `Admission application — ${appFees.map(f => f.name).join(", ")}`,
+          logo: "",
+        },
+        async callback(data: any) {
+          setPaying(false);
+          setVerifying(true);
+          try {
+            const verification = await financeApi.verifyPayment(paymentRef);
+            const verifyStatus = verification.status?.toUpperCase?.() ?? "";
+            if (verifyStatus !== "SUCCESS" && verifyStatus !== "SUCCESSFUL") {
+              setError("Payment verification returned status: " + (verification.status ?? "unknown") + ". Please contact support with reference: " + paymentRef);
+              setVerifying(false);
+              return;
+            }
+            await submitApplication();
+          } catch (err) {
+            setVerifying(false);
+            setError(err instanceof Error ? err.message : "Payment verification failed. Please contact support with reference: " + paymentRef);
+          }
+        },
+        onclose() {
+          setVerifying((v) => {
+            if (!v) setPaying(false);
+            return v;
+          });
+        },
+      });
+    }
 
     // Reset paying after checkout opens (callback/onclose will handle state)
     setPaying(false);
@@ -615,6 +685,35 @@ export default function AdmissionForm({ blocks }: { blocks?: WebsiteContentRecor
                 </div>
               </div>
               <p className="mt-2 text-xs text-amber-600">Payment is required before your application can be submitted.</p>
+            </div>
+          )}
+
+          {/* Gateway selector — shown when multiple gateways are available */}
+          {appFees.length > 0 && activeGateways.length > 1 && (
+            <div className="rounded-lg border border-slate-200 bg-white p-4">
+              <p className="mb-2 text-sm font-medium text-slate-700">Choose payment method:</p>
+              <div className="flex flex-wrap gap-3">
+                {activeGateways.map((gw) => (
+                  <button
+                    key={gw.id}
+                    type="button"
+                    onClick={() => setSelectedGateway(gw.id as GatewayId)}
+                    disabled={paying || verifying || submitting}
+                    className={
+                      'flex items-center gap-2 rounded-lg border-2 px-4 py-2.5 text-sm font-semibold transition disabled:opacity-50 ' +
+                      (selectedGateway === gw.id
+                        ? 'border-blue-600 bg-blue-50 text-blue-700'
+                        : 'border-slate-200 bg-white text-slate-600 hover:border-slate-300 hover:bg-slate-50')
+                    }
+                  >
+                    <CreditCard className="h-4 w-4" />
+                    {gw.name}
+                  </button>
+                ))}
+              </div>
+              <p className="mt-1.5 text-xs text-slate-400">
+                Both options are equally secure and work the same way. Choose whichever you prefer.
+              </p>
             </div>
           )}
 
