@@ -201,10 +201,6 @@ export default function PaymentModal({
             currency,
             payment_options: 'card, bank_transfer, ussd',
             customer: { email, name: email },
-            custom_texts: {
-              title,
-              description: desc,
-            },
             custom_texts: { title, description: desc },
             customizations: { title, description: desc, logo: '' },
             callback(data: any) {

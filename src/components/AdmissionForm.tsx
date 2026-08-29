@@ -56,7 +56,7 @@ const NIGERIAN_STATES = [
 ];
 
 const DOC_TYPES = [
-  { key: "PASSPORT_PHOTO", label: "Passport Photographs (2)", required: true },
+  { key: "PASSPORT_PHOTO", label: "Passport Photographs", required: true },
   { key: "BIRTH_CERTIFICATE", label: "Birth Certificate / Declaration of Age", required: true },
   { key: "CERTIFICATE", label: "Photocopies of Educational Certificates", required: true },
   { key: "TESTIMONIAL", label: "Testimonial from Last Institution", required: false },
@@ -121,7 +121,7 @@ export default function AdmissionForm({ blocks }: { blocks?: WebsiteContentRecor
   const [employment, setEmployment] = useState([{ employer: "", position: "", from: "", to: "" }]);
 
   // Documents
-  const [docFiles, setDocFiles] = useState<Record<string, File | null>>({});
+  const [docFiles, setDocFiles] = useState<Record<string, File[]>>({});
 
   // Declaration
   const [declaredAgreed, setDeclaredAgreed] = useState(false);
@@ -239,7 +239,7 @@ export default function AdmissionForm({ blocks }: { blocks?: WebsiteContentRecor
 
     // Required documents
     for (const dt of DOC_TYPES) {
-      if (dt.required && !docFiles[dt.key]) {
+      if (dt.required && (!docFiles[dt.key] || docFiles[dt.key].length === 0)) {
         missing.push(dt.label);
       }
     }
@@ -308,7 +308,7 @@ export default function AdmissionForm({ blocks }: { blocks?: WebsiteContentRecor
         setError("Payment gateway could not initialize. Please try again.");
         return;
       }
-      const paystackHandler = win.PaystackPop.setup({
+      win.PaystackPop.setup({
         key: gwPublicKey,
         email,
         amount: Math.round(totalFees * 100), // Paystack uses kobo
@@ -320,7 +320,7 @@ export default function AdmissionForm({ blocks }: { blocks?: WebsiteContentRecor
             { display_name: "Purpose", variable_name: "purpose", value: `Application fees: ${appFees.map(f => f.name).join(', ')}` },
           ],
         },
-        onSuccess: async () => {
+        callback: async (response: any) => {
           setPaying(false);
           setVerifying(true);
           try {
@@ -337,14 +337,13 @@ export default function AdmissionForm({ blocks }: { blocks?: WebsiteContentRecor
             setError(err instanceof Error ? err.message : "Payment verification failed. Please contact support with reference: " + paymentRef);
           }
         },
-        onClose: () => {
+        onclose: () => {
           setVerifying((v) => {
             if (!v) setPaying(false);
             return v;
           });
         },
       });
-      paystackHandler.openIframe();
     } else {
       // ── Flutterwave checkout ──
       if (typeof win.FlutterwaveCheckout !== "function") {
@@ -431,11 +430,14 @@ export default function AdmissionForm({ blocks }: { blocks?: WebsiteContentRecor
       });
 
       // Upload documents after application is created
-      const docs = Object.entries(docFiles).filter(([, f]) => f != null);
+      const docs = Object.entries(docFiles).filter(([, files]) => files.length > 0);
       if (docs.length > 0) {
-        for (const [type, file] of docs) {
-          setUploadProgress(`Uploading ${DOC_TYPES.find(d => d.key === type)?.label ?? type}…`);
-          await admissionsApi.uploadDocument(res.id, file!, type);
+        for (const [type, files] of docs) {
+          const label = DOC_TYPES.find(d => d.key === type)?.label ?? type;
+          for (const file of files) {
+            setUploadProgress(`Uploading ${label}…`);
+            await admissionsApi.uploadDocument(res.id, file, type);
+          }
         }
         setUploadProgress("");
       }
@@ -622,26 +624,58 @@ export default function AdmissionForm({ blocks }: { blocks?: WebsiteContentRecor
             <h3 className="mb-2 text-base font-bold text-slate-900 border-b border-slate-100 pb-3">Supporting Documents</h3>
             <p className="mb-4 text-xs text-slate-500">Upload required documents marked with <span className="font-semibold text-rose-500">*</span>. Optional documents can be uploaded if available.</p>
             <div className="grid gap-4 sm:grid-cols-2">
-              {DOC_TYPES.map(dt => (
-                <label key={dt.key} className="flex cursor-pointer items-center gap-3 rounded-lg border border-dashed border-slate-300 bg-slate-50 px-4 py-3 transition-colors hover:border-brand hover:bg-blue-50">
-                  {docFiles[dt.key] ? (
-                    <CheckCircle2 className="h-5 w-5 shrink-0 text-emerald-500" />
+              {DOC_TYPES.map(dt => {
+                const files = docFiles[dt.key] ?? [];
+                const isMulti = dt.key === 'CERTIFICATE';
+                return (
+                <div key={dt.key} className="rounded-lg border border-dashed border-slate-300 bg-slate-50 px-4 py-3 transition-colors hover:border-brand hover:bg-blue-50">
+                  {files.length > 0 ? (
+                    <div className="flex flex-col gap-1.5">
+                      {files.map((f, i) => (
+                        <div key={i} className="flex items-center gap-2">
+                          <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-500" />
+                          <span className="flex-1 truncate text-xs text-slate-600">{f.name}</span>
+                          <button type="button" onClick={() => setDocFiles(prev => ({ ...prev, [dt.key]: prev[dt.key].filter((_, idx) => idx !== i) }))}
+                            className="flex h-5 w-5 items-center justify-center rounded text-red-400 hover:bg-red-50 hover:text-red-600">
+                            <X className="h-3 w-3" />
+                          </button>
+                        </div>
+                      ))}
+                      {isMulti && (
+                        <label className="mt-1 flex cursor-pointer items-center gap-2 text-xs text-brand hover:underline">
+                          <Upload className="h-3.5 w-3.5" />
+                          Add more files
+                          <input type="file" className="hidden" multiple accept=".pdf,.jpg,.jpeg,.png"
+                            onChange={e => {
+                              const newFiles = e.target.files ? Array.from(e.target.files) : [];
+                              e.target.value = '';
+                              if (newFiles.length > 0) {
+                                setDocFiles(prev => ({ ...prev, [dt.key]: [...(prev[dt.key] ?? []), ...newFiles] }));
+                              }
+                            }} />
+                        </label>
+                      )}
+                    </div>
                   ) : (
-                    <Upload className="h-5 w-5 shrink-0 text-brand" />
+                    <label className="flex cursor-pointer items-center gap-3">
+                      <Upload className="h-5 w-5 shrink-0 text-brand" />
+                      <span className="flex-1 text-sm text-slate-600">
+                        {dt.label}{dt.required && <span className="text-rose-500 font-semibold"> *</span>}
+                        {isMulti && <span className="ml-1 text-xs text-slate-400">(multiple files allowed)</span>}
+                      </span>
+                      <input type="file" className="hidden" multiple={isMulti} accept=".pdf,.jpg,.jpeg,.png"
+                        onChange={e => {
+                          const newFiles = e.target.files ? Array.from(e.target.files) : [];
+                          e.target.value = '';
+                          if (newFiles.length > 0) {
+                            setDocFiles(prev => ({ ...prev, [dt.key]: newFiles }));
+                          }
+                        }} />
+                    </label>
                   )}
-                  <span className="flex-1 text-sm text-slate-600">
-                    {docFiles[dt.key] ? docFiles[dt.key]!.name : <>{dt.label}{dt.required && <span className="text-rose-500 font-semibold"> *</span>}</>}
-                  </span>
-                  {docFiles[dt.key] && (
-                    <button type="button" onClick={(e) => { e.preventDefault(); setDocFiles(prev => { const c = { ...prev }; delete c[dt.key]; return c; }); }}
-                      className="flex h-6 w-6 items-center justify-center rounded text-red-400 hover:bg-red-50 hover:text-red-600">
-                      <X className="h-3.5 w-3.5" />
-                    </button>
-                  )}
-                  <input type="file" className="hidden" accept=".pdf,.jpg,.jpeg,.png"
-                    onChange={e => { if (e.target.files?.[0]) setDocFiles(prev => ({ ...prev, [dt.key]: e.target.files![0] })); }} />
-                </label>
-              ))}
+                </div>
+                );
+              })}
             </div>
           </div>
 
